@@ -140,9 +140,13 @@ impl Individual {
                 // random value that fits in the logical Iota memory width:
                 //ind.mGenome[idx] = rand() % (1UL << mArchWidth);
 
-                // or, alternatively, the following line replaces a char with any
-                // random *printable* char for a prettier display during evolution:
-                *instr = rng.gen_range(32..127);
+                // or, alternatively, the following line replaces a char with:
+                // any random *printable* char for a prettier display during evolution:
+                *instr = rng.gen_range(32..=126);
+                // } else {
+                //     // or incr or decr the instruction by one:
+                //     if rng.gen() { instr.wrapping_add(1) } else { instr.wrapping_sub(1) }
+                // };
             }
         }
     }
@@ -189,7 +193,7 @@ impl Fitnesses<Individual, Heuristic> for ReusmannTextSimilarity {
             let mut count = 0.0;
             for (a, b) in HELLO_WORLD.as_bytes().iter().zip(&output) {
                 let diff = if a > b { a - b } else { b - a };
-                count += 1.0 - (diff as f64 / 256.0);
+                count += if diff == 0 { 1.0 } else if diff <= 50 { 0.3 } else { 0.0 };
             }
 
             // Optional to evolve an exact-length solution:
@@ -232,7 +236,8 @@ impl Fitnesses<Individual, Heuristic> for ReusmannSimilarityRMS {
             }
 
             let rms = (sum_errors_squared / HELLO_WORLD.len() as f64).sqrt();
-            OrderedFloat(1.0 / (1.0 + rms))
+            let fitness = 1.0 / (1.0 + rms);
+            OrderedFloat(fitness)
         })
         .collect()
     }
