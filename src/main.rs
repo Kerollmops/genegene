@@ -1,10 +1,12 @@
 use std::cmp::{self, Reverse};
+use std::fmt;
 use std::io::empty;
 
 use bstr::ByteSlice as _;
+use ordered_float::OrderedFloat;
 use rand::distributions::Alphanumeric;
-use rand::{Rng, SeedableRng};
 use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use reustmann::instruction::op_codes;
 use reustmann::instruction::{Instruction, OpCode};
@@ -13,7 +15,7 @@ use reustmann::{Program, Interpreter};
 
 use genegene::{Genetic, Fitnesses, Reproduce};
 
-const PROGRAM_LENGTH: usize = 150;
+const ARCH_LENGTH: usize = 32;
 const HELLO_WORLD: &str = "Hello World!";
 const INSTRUCTIONS: [Instruction; 46] = [
     Instruction::Nop,
@@ -72,7 +74,7 @@ fn random_instruction<R: Rng + ?Sized>(rng: &mut R) -> u8 {
     }
 }
 
-type Heuristic = u32;
+type Heuristic = OrderedFloat<f64>;
 
 #[derive(Clone)]
 struct Individual {
@@ -102,21 +104,21 @@ impl Individual {
                 .chain(&parent1[p0..p0 + p1 - p0])
                 .chain(&parent0[p1..])
                 .chain(&parent0[0..p0])
-                .take(PROGRAM_LENGTH)
+                .take(ARCH_LENGTH)
                 .cloned()
                 .collect(),
             1 => // Aaaaabbbbbaaaaa
                 parent0[0..p0].iter()
                 .chain(&parent1[p0..])
                 .chain(&parent0[p1..])
-                .take(PROGRAM_LENGTH)
+                .take(ARCH_LENGTH)
                 .cloned()
                 .collect(),
             _ => // aaaaabbbbbAaaaa
                 parent0[p0..p0 + p1 - p0].iter()
                 .chain(&parent1[p1..])
                 .chain(&parent0[p0..])
-                .take(PROGRAM_LENGTH)
+                .take(ARCH_LENGTH)
                 .cloned()
                 .collect(),
         };
@@ -125,23 +127,37 @@ impl Individual {
     }
 
     fn mutate<R: Rng + ?Sized>(&mut self, rng: &mut R, mutation_rate: f64) {
-        let num_chars_to_mutate = (
-            mutation_rate * self.instructions.len() as f64
-            + 0.5 + rng.gen::<f64>()
-        ) as usize;
+        let num_instrs = self.instructions.len();
+        if rng.gen::<f64>() < mutation_rate * num_instrs as f64 {
+            let num_chars_to_mutate = mutation_rate * num_instrs as f64 + 0.5 + rng.gen::<f64>();
+            for _ in 0..num_chars_to_mutate as usize {
+                let instr = self.instructions.choose_mut(rng).unwrap();
 
-        for _ in 0..num_chars_to_mutate {
-            if let Some(chosen) = self.instructions.choose_mut(rng) {
-                *chosen = random_instruction(rng);
+                // This replaces a char with a random char from the Iota opcode set:
+                //ind.mGenome[idx] = programCharset[rand() % programCharset.size()];
+
+                // or, alternatively, the following line replaces a char with any
+                // random value that fits in the logical Iota memory width:
+                //ind.mGenome[idx] = rand() % (1UL << mArchWidth);
+
+                // or, alternatively, the following line replaces a char with any
+                // random *printable* char for a prettier display during evolution:
+                *instr = rng.gen_range(32..127);
             }
         }
+    }
+}
+
+impl fmt::Debug for Individual {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.instructions.as_bstr())
     }
 }
 
 fn program_output(instructions: &[u8]) -> Vec<u8> {
     let program = Program::from_iter(instructions.iter().cloned());
 
-    let arch_length = PROGRAM_LENGTH; // memory length
+    let arch_length = ARCH_LENGTH; // memory length
     let arch_width = 8; // word size
     let mut interpreter = Interpreter::new(arch_length, arch_width).unwrap();
     interpreter.copy_program(&program);
@@ -149,7 +165,7 @@ fn program_output(instructions: &[u8]) -> Vec<u8> {
     let mut input = empty(); // no input data needed
     let mut output = Vec::new(); // output on the standard
 
-    for _ in 0..5_000 { // limit
+    for _ in 0..200 { // limit
         // each interpreter step return a statement
         // while no `HALT` statement is found, we continue
         match interpreter.step(&mut input, &mut output) {
@@ -161,16 +177,19 @@ fn program_output(instructions: &[u8]) -> Vec<u8> {
     output
 }
 
-struct ReusmannFitnesses;
+/// Compare string a with "Hello World!".
+/// Returns 0..1.0, where 1.0 is a perfect match.
+struct ReusmannTextSimilarity;
 
-impl Fitnesses<Individual, Heuristic> for ReusmannFitnesses {
+impl Fitnesses<Individual, Heuristic> for ReusmannTextSimilarity {
     fn fitnesses(&mut self, population: &[Individual]) -> Vec<Heuristic> {
         population.par_iter().map(|individual| {
             let output = program_output(&individual.instructions);
 
             let mut count = 0.0;
             for (a, b) in HELLO_WORLD.as_bytes().iter().zip(&output) {
-                if a == b { count += 1.0 }
+                let diff = if a > b { a - b } else { b - a };
+                count += 1.0 - (diff as f64 / 256.0);
             }
 
             // Optional to evolve an exact-length solution:
@@ -178,17 +197,76 @@ impl Fitnesses<Individual, Heuristic> for ReusmannFitnesses {
             // Exact length counts as much as getting one char correct:
             if HELLO_WORLD.len() == output.len() { count += 1.0 }
 
-            // normalize to [0.0..u16::MAX + 1]
+            // normalize to [0.0..1.0 + 1]
             let max = HELLO_WORLD.len() as f64 + 1.0;
-            let fitness = (count / max) * u16::MAX as f64;
-            fitness as u32
+            OrderedFloat(count / max)
         })
         .collect()
     }
 }
 
+/// Compare string a with a reference string. Think of them as two abstract vectors.
+/// Calculate the root mean square difference between the two.
+/// Returns 0..1.0, where 1.0 is a perfect match.
+/// Assumes 8-bit chars.
+struct ReusmannSimilarityRMS;
+
+impl Fitnesses<Individual, Heuristic> for ReusmannSimilarityRMS {
+    fn fitnesses(&mut self, population: &[Individual]) -> Vec<Heuristic> {
+        population.par_iter().map(|individual| {
+            let output = program_output(&individual.instructions);
+
+            let length = cmp::min(output.len(), HELLO_WORLD.len());
+            if length == 0 || output.len() == 0 || HELLO_WORLD.len() == 0 {
+                return OrderedFloat(0.0);
+            }
+
+            // Any missing elements count as maximum error
+            let diff = if HELLO_WORLD.len() > length { HELLO_WORLD.len() - length }
+            else { length - HELLO_WORLD.len() };
+            let mut sum_errors_squared = diff as f64 * 256.0 * 256.0;
+
+            for (a, b) in output.iter().zip(HELLO_WORLD.as_bytes()) {
+                let diff = if a > b { a - b } else { b - a } as f64;
+                sum_errors_squared += diff * diff;
+            }
+
+            let rms = (sum_errors_squared / HELLO_WORLD.len() as f64).sqrt();
+            OrderedFloat(1.0 / (1.0 + rms))
+        })
+        .collect()
+    }
+}
+
+/// Quick and easy who-mates-and-who-dies algorithm using two thresholds.
+/// The thresholds are between 0.0 and 1.0, and are percentiles for the
+/// current set of fitness measurements after sorting.
+/// The diagram below shows two typical threshold values which can be
+/// changed with command line options -F and -E.
+///
+/// ```text
+/// +--------------------------------------------+ 1.0 best fitness
+/// | Always a parent; lives another generation  |
+/// +--------------------------------------------+ ~0.9 <= Elite threshold (-E)
+/// |                                            |
+/// | May be a parent; lives another generation  |
+/// |                                            |
+/// +--------------------------------------------+ ~0.5 <= Fitness Deletion Threshold (-F)
+/// |                                            |
+/// | Does not survive the generation,           |
+/// | Replaced by new offspring                  |
+/// |                                            |
+/// +--------------------------------------------+ 0.0 worst fitness
+/// ```
+///
+/// This function iterates through individuals from the worst fitness to the
+/// fitness deletion threshold, replacing each with a new individual. Rather
+/// than deleting an object only to have to create a replacement, we just
+/// simply overwrite the genome with a new one derived from two parents
+/// selected from above the thresholds. A new genome makes a new individual.
 struct ReusmannReproduction<R> {
     rng: R,
+    select_elite: usize,
     elite_threshold: f64,
     fitness_deletion_threshold: f64,
     mutation_rate: f64,
@@ -198,91 +276,127 @@ impl<R> Reproduce<Individual, Heuristic> for ReusmannReproduction<R>
 where
     R: Rng + Clone + Send + Sync
 {
-    /// Quick and easy who-mates-and-who-dies algorithm using two thresholds.
-    /// The thresholds are between 0.0 and 1.0, and are percentiles for the
-    /// current set of fitness measurements after sorting.
-    /// The diagram below shows two typical threshold values which can be
-    /// changed with command line options -F and -E.
-    ///
-    /// ```text
-    /// +--------------------------------------------+ 1.0 best fitness
-    /// | Always a parent; lives another generation  |
-    /// +--------------------------------------------+ ~0.9 <= Elite threshold (-E)
-    /// |                                            |
-    /// | May be a parent; lives another generation  |
-    /// |                                            |
-    /// +--------------------------------------------+ ~0.5 <= Fitness Deletion Threshold (-F)
-    /// |                                            |
-    /// | Does not survive the generation,           |
-    /// | Replaced by new offspring                  |
-    /// |                                            |
-    /// +--------------------------------------------+ 0.0 worst fitness
-    /// ```
-    ///
-    /// This function iterates through individuals from the worst fitness to the
-    /// fitness deletion threshold, replacing each with a new individual. Rather
-    /// than deleting an object only to have to create a replacement, we just
-    /// simply overwrite the genome with a new one derived from two parents
-    /// selected from above the thresholds. A new genome makes a new individual.
     fn reproduce(&mut self, population: &[Individual], heuristics: &[Heuristic]) -> Vec<Individual> {
         // We sort the individuals by their heuristic.
-        let mut population: Vec<_> = population.iter().enumerate().map(|(i, ind)| (ind, heuristics[i])).collect();
-        population.sort_unstable_by_key(|(_, h)| Reverse(*h));
+        let mut population: Vec<_> = population.iter().enumerate().collect();
+        population.sort_unstable_by_key(|(i, _)| Reverse(heuristics[*i]));
 
-        let elite_threshold = (population.len() as f64 * (1.0 - self.elite_threshold)) as usize;
-        let fitness_threshold = (population.len() as f64 * (1.0 - self.fitness_deletion_threshold)) as usize;
+        let pop_len = population.len() as f64;
+        let elite_threshold = (pop_len * (1.0 - self.elite_threshold)) as usize;
+        let fitness_threshold = (pop_len * (1.0 - self.fitness_deletion_threshold)) as usize;
 
         let elite_parents = &population[..elite_threshold];
         let parents = &population[..fitness_threshold];
 
-        (0..population.len()).into_par_iter().map_with(self.rng.clone(), |rng, _| {
-            // Select two parents, one from above the elite threshold, the other will be
-            // a random selection above the fitness deletion threshold, which might or might
-            // not be from the elite section.
-            let (p0, _h0) = elite_parents.choose(rng).unwrap();
-            let (p1, _h1) = parents.choose(rng).unwrap();
+        // complete the population with some children.
+        let remaining = population.len().saturating_sub(self.select_elite);
+        let mut new_population: Vec<Individual> = (0..remaining)
+            .into_par_iter()
+            .map_with(self.rng.clone(), |rng, _| {
+                // Select two parents, one from above the elite threshold, the other will be
+                // a random selection above the fitness deletion threshold, which might or might
+                // not be from the elite section.
+                let (_h0, p0) = elite_parents.choose(rng).unwrap();
+                let (_h1, p1) = parents.choose(rng).unwrap();
+                p0.crossover(rng, p1)
+            })
+            .collect();
 
-            let mut child = p0.crossover(rng, p1);
-            if rng.gen::<f64>() <= self.mutation_rate * child.instructions.len() as f64 {
-                child.mutate(rng, self.mutation_rate);
-            }
-            child
-        })
-        .collect()
+        // This mutates some individual's genomes by randomly changing
+        // a single character to a random Iota opcode letter.
+        for individual in &mut new_population {
+            individual.mutate(&mut self.rng, self.mutation_rate);
+        }
+
+        // select a number of parents in the elite population.
+        let iter = elite_parents.iter().map(|(_, ind)| (*ind).clone()).take(self.select_elite);
+        new_population.extend(iter);
+
+        new_population
+    }
+}
+
+#[derive(Debug)]
+struct Stats {
+    first_quartile: f64,
+    median: f64,
+    third_quartile: f64,
+    average: f64,
+}
+
+impl Stats {
+    fn from_heuristics(heuristics: &[Heuristic]) -> Stats {
+        let mut heuristics = heuristics.to_vec();
+        heuristics.sort_unstable();
+        heuristics.reverse();
+
+        let heuristics_len = heuristics.len() as f64;
+        let one_quartile_len = (heuristics.len() / 4) as f64;
+        let first_quartile = heuristics.len() / 4;
+        let third_quartile = heuristics.len() / 4 * 3;
+        let sum = |acc, f: &OrderedFloat<f64>| acc + **f;
+
+        Stats {
+            first_quartile: heuristics[..first_quartile].iter().fold(0.0, sum) / one_quartile_len,
+            median: *heuristics[heuristics.len() / 2],
+            third_quartile: heuristics[third_quartile..].iter().fold(0.0, sum) / one_quartile_len,
+            average: heuristics.iter().fold(0.0, sum) / heuristics_len,
+        }
     }
 }
 
 // Here is the perfect program for this task:
 // Gp..OOOOOOOOOOOOHTFello World!
+//
+// Here a program found by this algorithm:
+// Fello WormdBz.Zt. h%%O},qiO3d}U,
 fn main() {
     let seed = rand::random();
     eprintln!("using the seed: 0x{:02x}", seed);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-    let population_size = 10_000;
+    let population_size = 1000;
     let population = (0..population_size).map(|_| Individual::from_rng(&mut rng)).collect();
-    let fitnesses = ReusmannFitnesses;
+    let fitnesses = ReusmannTextSimilarity;
     let reproduce = ReusmannReproduction {
         rng: rng.clone(),
+        select_elite: 1,
         elite_threshold: 0.9,
         fitness_deletion_threshold: 0.5,
-        mutation_rate: 0.05,
+        mutation_rate: 0.01,
     };
-    let mut gene = Genetic::new(population, fitnesses, reproduce);
 
-    let mut remaining = 10_000;
-    while let Some((generation, best_heuristic)) = gene.next() {
-        println!("generation: {}, best heuristic: {}", generation, best_heuristic);
-        if let Some((i, _h)) = gene.heuristics().iter().enumerate().max_by_key(|(_, h)| *h) {
-            let individual = &gene.population()[i];
-            let output = program_output(&individual.instructions);
-            println!("best individual:");
-            println!("{:?}", individual.instructions.as_bstr());
-            println!("output: {:?}", output.as_bstr());
-            println!();
+    let mut gene = Genetic::new(population, fitnesses, reproduce);
+    let mut remaining = 1_000_000_000;
+    let mut previous_heuristic = OrderedFloat(0.0);
+
+    while let Some((generation, heuristic)) = gene.next() {
+        if remaining % 10_000 == 0 {
+            let stats = Stats::from_heuristics(&gene.heuristics());
+            eprintln!("generation: {}, best: {:.04}", generation, heuristic);
+            eprintln!("{:.04?}", stats);
+            if let Some((i, _h)) = gene.heuristics().iter().enumerate().max_by_key(|(_, h)| *h) {
+                let individual = &gene.population()[i];
+                let output = program_output(&individual.instructions);
+                eprintln!("best output: {:?}", output.as_bstr());
+                eprintln!();
+            }
+
+            if heuristic > previous_heuristic {
+                previous_heuristic = heuristic;
+                eprint!("\x07");
+            }
         }
 
         remaining -= 1;
-        if remaining == 0 { break }
+        if heuristic == 1.0 || remaining == 0 { break }
+    }
+
+    let heuristics = gene.heuristics();
+    let population = gene.population();
+    if let Some((i, ind)) = population.iter().enumerate().max_by_key(|(i, _)| heuristics[*i]) {
+        println!("best individual: {:?}", ind);
+        println!("best score: {:.04?}", *heuristics[i]);
+        println!("best output: {:?}", program_output(&ind.instructions).as_bstr());
     }
 }

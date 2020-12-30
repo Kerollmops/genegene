@@ -36,8 +36,8 @@ where
         self.population = self.reproduce.reproduce(&self.population, &self.heuristics);
         self.heuristics = self.fitnesses.fitnesses(&self.population);
         self.generation += 1;
-        match self.heuristics.iter().max() {
-            Some(heuristic) => Some((self.generation, heuristic.clone())),
+        match self.heuristics.iter().max().cloned() {
+            Some(heuristic) => Some((self.generation, heuristic)),
             None => None,
         }
     }
