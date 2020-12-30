@@ -303,7 +303,9 @@ dependencies = [
 
 [[package]]
 name = "reustmann"
-version = "0.2.0"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7552eda49d3d408cf863ca2d6be6a93f01b9ed6f07094e16d378cefecc5bd3"
 dependencies = [
  "colorify",
  "nom",

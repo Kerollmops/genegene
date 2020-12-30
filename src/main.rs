@@ -1,17 +1,17 @@
+use std::cmp::{self, Reverse};
 use std::io::empty;
-use std::{cmp, iter};
 
 use bstr::ByteSlice as _;
 use rand::distributions::Alphanumeric;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use reustmann::instruction::op_codes;
 use reustmann::instruction::{Instruction, OpCode};
 use reustmann::Statement;
 use reustmann::{Program, Interpreter};
 
-use genegene::{Genetic, RouletteWheel};
-use genegene::{Fitness, Operator};
+use genegene::{Genetic, Fitnesses, Reproduce};
 
 const PROGRAM_LENGTH: usize = 150;
 const HELLO_WORLD: &str = "Hello World!";
@@ -161,65 +161,114 @@ fn program_output(instructions: &[u8]) -> Vec<u8> {
     output
 }
 
-struct ReusmannFitness;
+struct ReusmannFitnesses;
 
-impl Fitness<Individual, Heuristic> for ReusmannFitness {
-    fn fitness(&self, individual: &Individual) -> Heuristic {
-        let output = program_output(&individual.instructions);
+impl Fitnesses<Individual, Heuristic> for ReusmannFitnesses {
+    fn fitnesses(&mut self, population: &[Individual]) -> Vec<Heuristic> {
+        population.par_iter().map(|individual| {
+            let output = program_output(&individual.instructions);
 
-        let mut count = 0.0;
-        for (a, b) in HELLO_WORLD.as_bytes().iter().zip(&output) {
-            if a == b { count += 1.0 }
-        }
+            let mut count = 0.0;
+            for (a, b) in HELLO_WORLD.as_bytes().iter().zip(&output) {
+                if a == b { count += 1.0 }
+            }
 
-        // Optional to evolve an exact-length solution:
-        // Give credit for having the correct length;
-        // Exact length counts as much as getting one char correct:
-        if HELLO_WORLD.len() == output.len() { count += 1.0 }
+            // Optional to evolve an exact-length solution:
+            // Give credit for having the correct length;
+            // Exact length counts as much as getting one char correct:
+            if HELLO_WORLD.len() == output.len() { count += 1.0 }
 
-        // normalize to [0.0..u16::MAX + 1]
-        let max = HELLO_WORLD.len() as f64 + 1.0;
-        let fitness = (count / max) * u16::MAX as f64;
-        fitness as u32
+            // normalize to [0.0..u16::MAX + 1]
+            let max = HELLO_WORLD.len() as f64 + 1.0;
+            let fitness = (count / max) * u16::MAX as f64;
+            fitness as u32
+        })
+        .collect()
     }
 }
 
-struct ReusmannCrossoverMutation<'r, R: 'r + ?Sized> {
-    rng: &'r mut R,
+struct ReusmannReproduction<R> {
+    rng: R,
+    elite_threshold: f64,
+    fitness_deletion_threshold: f64,
     mutation_rate: f64,
 }
 
-impl<R: Rng + ?Sized> Operator<Individual> for ReusmannCrossoverMutation<'_, R> {
-    fn complete(&mut self, population: &[Individual], limit: usize) -> Vec<Individual> {
-        let iter = iter::from_fn(|| {
-            let mut iter = population.choose_multiple(self.rng, 2);
-            match iter.next().zip(iter.next()) {
-                Some((mother, father)) => {
-                    let mut child = mother.crossover(self.rng, father);
-                    if self.rng.gen::<f64>() <= self.mutation_rate * child.instructions.len() as f64 {
-                        child.mutate(self.rng, self.mutation_rate);
-                    }
-                    Some(child)
-                },
-                None => None
-            }
-        });
+impl<R> Reproduce<Individual, Heuristic> for ReusmannReproduction<R>
+where
+    R: Rng + Clone + Send + Sync
+{
+    /// Quick and easy who-mates-and-who-dies algorithm using two thresholds.
+    /// The thresholds are between 0.0 and 1.0, and are percentiles for the
+    /// current set of fitness measurements after sorting.
+    /// The diagram below shows two typical threshold values which can be
+    /// changed with command line options -F and -E.
+    ///
+    /// ```text
+    /// +--------------------------------------------+ 1.0 best fitness
+    /// | Always a parent; lives another generation  |
+    /// +--------------------------------------------+ ~0.9 <= Elite threshold (-E)
+    /// |                                            |
+    /// | May be a parent; lives another generation  |
+    /// |                                            |
+    /// +--------------------------------------------+ ~0.5 <= Fitness Deletion Threshold (-F)
+    /// |                                            |
+    /// | Does not survive the generation,           |
+    /// | Replaced by new offspring                  |
+    /// |                                            |
+    /// +--------------------------------------------+ 0.0 worst fitness
+    /// ```
+    ///
+    /// This function iterates through individuals from the worst fitness to the
+    /// fitness deletion threshold, replacing each with a new individual. Rather
+    /// than deleting an object only to have to create a replacement, we just
+    /// simply overwrite the genome with a new one derived from two parents
+    /// selected from above the thresholds. A new genome makes a new individual.
+    fn reproduce(&mut self, population: &[Individual], heuristics: &[Heuristic]) -> Vec<Individual> {
+        // We sort the individuals by their heuristic.
+        let mut population: Vec<_> = population.iter().enumerate().map(|(i, ind)| (ind, heuristics[i])).collect();
+        population.sort_unstable_by_key(|(_, h)| Reverse(*h));
 
-        // TODO complete with randoms
-        iter.take(limit).collect()
+        let elite_threshold = (population.len() as f64 * (1.0 - self.elite_threshold)) as usize;
+        let fitness_threshold = (population.len() as f64 * (1.0 - self.fitness_deletion_threshold)) as usize;
+
+        let elite_parents = &population[..elite_threshold];
+        let parents = &population[..fitness_threshold];
+
+        (0..population.len()).into_par_iter().map_with(self.rng.clone(), |rng, _| {
+            // Select two parents, one from above the elite threshold, the other will be
+            // a random selection above the fitness deletion threshold, which might or might
+            // not be from the elite section.
+            let (p0, _h0) = elite_parents.choose(rng).unwrap();
+            let (p1, _h1) = parents.choose(rng).unwrap();
+
+            let mut child = p0.crossover(rng, p1);
+            if rng.gen::<f64>() <= self.mutation_rate * child.instructions.len() as f64 {
+                child.mutate(rng, self.mutation_rate);
+            }
+            child
+        })
+        .collect()
     }
 }
 
+// Here is the perfect program for this task:
 // Gp..OOOOOOOOOOOOHTFello World!
 fn main() {
-    let mut rng = rand::thread_rng();
+    let seed = rand::random();
+    eprintln!("using the seed: 0x{:02x}", seed);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
     let population_size = 10_000;
     let population = (0..population_size).map(|_| Individual::from_rng(&mut rng)).collect();
-    let fitness = ReusmannFitness;
-    let selection = RouletteWheel { rng: &mut rng.clone(), take_limit_ratio: 0.05 };
-    let operator = ReusmannCrossoverMutation { rng: &mut rng, mutation_rate: 0.02 };
-    let mut gene = Genetic::new(population, fitness, selection, operator);
+    let fitnesses = ReusmannFitnesses;
+    let reproduce = ReusmannReproduction {
+        rng: rng.clone(),
+        elite_threshold: 0.9,
+        fitness_deletion_threshold: 0.5,
+        mutation_rate: 0.05,
+    };
+    let mut gene = Genetic::new(population, fitnesses, reproduce);
 
     let mut remaining = 10_000;
     while let Some((generation, best_heuristic)) = gene.next() {
