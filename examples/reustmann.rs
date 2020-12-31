@@ -323,9 +323,10 @@ where
 
 #[derive(Debug)]
 struct Stats {
-    first_quartile: f64,
+    p90: f64,
+    p75: f64,
     median: f64,
-    third_quartile: f64,
+    p25: f64,
     average: f64,
 }
 
@@ -333,19 +334,18 @@ impl Stats {
     fn from_heuristics(heuristics: &[Heuristic]) -> Stats {
         let mut heuristics = heuristics.to_vec();
         heuristics.sort_unstable();
-        heuristics.reverse();
 
-        let heuristics_len = heuristics.len() as f64;
-        let one_quartile_len = (heuristics.len() / 4) as f64;
-        let first_quartile = heuristics.len() / 4;
-        let third_quartile = heuristics.len() / 4 * 3;
-        let sum = |acc, f: &OrderedFloat<f64>| acc + **f;
+        let p90 = heuristics.len() / 100 * 90;
+        let p75 = heuristics.len() / 100 * 75;
+        let median = heuristics.len() / 2;
+        let p25 = heuristics.len() / 100 * 25;
 
         Stats {
-            first_quartile: heuristics[..first_quartile].iter().fold(0.0, sum) / one_quartile_len,
-            median: *heuristics[heuristics.len() / 2],
-            third_quartile: heuristics[third_quartile..].iter().fold(0.0, sum) / one_quartile_len,
-            average: heuristics.iter().fold(0.0, sum) / heuristics_len,
+            p90: *heuristics[p90],
+            p75: *heuristics[p75],
+            median: *heuristics[median],
+            p25: *heuristics[p25],
+            average: heuristics.iter().fold(0.0, |acc, f| acc + **f) / heuristics.len() as f64,
         }
     }
 }
@@ -355,6 +355,7 @@ impl Stats {
 //
 // Here a program found by this algorithm:
 // Fello WormdBz.Zt. h%%O},qiO3d}U,
+// $dlko}WnrkdLz(ddd@trO.VrjVkrOr@d
 fn main() {
     let seed = rand::random();
     eprintln!("using the seed: 0x{:02x}", seed);
