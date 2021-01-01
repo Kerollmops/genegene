@@ -1,9 +1,10 @@
 use std::cmp::{self, Reverse};
-use std::fmt;
-use std::io::empty;
+use std::fs::File;
+use std::io::Write;
 
 use bstr::ByteSlice as _;
 use ordered_float::OrderedFloat;
+use rand::distributions::Alphanumeric;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -14,8 +15,10 @@ use reustmann::{Program, Interpreter};
 
 use genegene::{Genetic, Fitnesses, Reproduce};
 
-const ARCH_LENGTH: usize = 32;
-const TARGET: &str = "Hello World!";
+const ARCH_LENGTH: usize = 100; // memory length
+const ARCH_WIDTH: usize = 8; // word size
+const CYCLE_LIMIT: usize = 200; // max cycles to run
+const INPUT: &str = "kerollmops";
 const INSTRUCTIONS: [Instruction; 46] = [
     Instruction::Nop,
     Instruction::Reset,
@@ -73,9 +76,16 @@ fn random_instruction<R: Rng + ?Sized>(rng: &mut R) -> u8 {
     }
 }
 
+fn random_string<R: Rng + ?Sized>(rng: &mut R, length: usize) -> String {
+    (0..length)
+        .map(|_| rng.sample(Alphanumeric))
+        .map(char::from)
+        .collect()
+}
+
 type Heuristic = OrderedFloat<f64>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Individual {
     instructions: Vec<OpCode>,
 }
@@ -155,24 +165,14 @@ impl Individual {
     }
 }
 
-impl fmt::Debug for Individual {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.instructions.as_bstr())
-    }
-}
-
-fn program_output(instructions: &[u8]) -> Vec<u8> {
+fn execute_program<A: AsRef<[u8]>>(input: A, instructions: &[u8]) -> Vec<u8> {
     let program = Program::from_iter(instructions.iter().cloned());
-
-    let arch_length = ARCH_LENGTH; // memory length
-    let arch_width = 8; // word size
-    let mut interpreter = Interpreter::new(arch_length, arch_width).unwrap();
+    let mut interpreter = Interpreter::new(ARCH_LENGTH, ARCH_WIDTH).unwrap();
     interpreter.copy_program(&program);
 
-    let mut input = empty(); // no input data needed
-    let mut output = Vec::new(); // output on the standard
-
-    for _ in 0..200 { // limit
+    let mut input = input.as_ref();
+    let mut output = Vec::new();
+    for _ in 0..CYCLE_LIMIT {
         // each interpreter step return a statement
         // while no `HALT` statement is found, we continue
         match interpreter.step(&mut input, &mut output) {
@@ -186,65 +186,45 @@ fn program_output(instructions: &[u8]) -> Vec<u8> {
 
 /// Compare string a with "Hello World!".
 /// Returns 0..1.0, where 1.0 is a perfect match.
-struct ReusmannTextSimilarity;
-
-impl Fitnesses<Individual, Heuristic> for ReusmannTextSimilarity {
-    fn fitnesses(&mut self, population: &[Individual]) -> Vec<Heuristic> {
-        population.par_iter().map(|individual| {
-            let output = program_output(&individual.instructions);
-
-            let mut count = 0.0;
-            for (a, b) in TARGET.as_bytes().iter().zip(&output) {
-                count += if a == b { 1.0 } else { 0.0 };
-                // let diff = if a > b { a - b } else { b - a };
-                // count += if diff == 0 { 1.0 } else if diff <= 50 { 0.3 } else { 0.0 };
-                // count += 1.0 - diff as f64 / u8::MAX as f64;
-            }
-
-            // Optional to evolve an exact-length solution:
-            // Give credit for having the correct length;
-            // Exact length counts as much as getting one char correct:
-            if TARGET.len() == output.len() {
-                count += 1.0;
-            }
-
-            // normalize to [0.0..1.0 + 1]
-            let max = TARGET.len() as f64 + 1.0;
-            OrderedFloat(count / max)
-        })
-        .collect()
-    }
+struct ReusmannTextSimilarity<R> {
+    rng: R,
 }
 
-/// Compare string a with a reference string. Think of them as two abstract vectors.
-/// Calculate the root mean square difference between the two.
-/// Returns 0..1.0, where 1.0 is a perfect match.
-/// Assumes 8-bit chars.
-struct ReusmannSimilarityRMS;
-
-impl Fitnesses<Individual, Heuristic> for ReusmannSimilarityRMS {
+impl<R> Fitnesses<Individual, Heuristic> for ReusmannTextSimilarity<R>
+where
+    R: Rng + Clone + Send + Sync
+{
     fn fitnesses(&mut self, population: &[Individual]) -> Vec<Heuristic> {
+        // We generate some random inputs.
+        let inputs: Vec<String> = (3..10).map(|_| {
+            let length = self.rng.gen_range(5..=30);
+            random_string(&mut self.rng, length)
+        }).collect();
+
         population.par_iter().map(|individual| {
-            let output = program_output(&individual.instructions);
+            let mut score = 0.0;
+            for input in &inputs {
+                let target = input.to_uppercase();
+                let output = execute_program(input, &individual.instructions);
 
-            let length = cmp::min(output.len(), TARGET.len());
-            if length == 0 || output.len() == 0 || TARGET.len() == 0 {
-                return OrderedFloat(0.0);
+                let mut count = 0.0;
+                for (a, b) in target.as_bytes().iter().zip(&output) {
+                    count += if a == b { 1.0 } else { 0.0 };
+                }
+
+                // Optional to evolve an exact-length solution:
+                // Give credit for having the correct length;
+                // Exact length counts as much as getting one char correct:
+                if target.len() == output.len() {
+                    count += 1.0;
+                }
+
+                // normalize to [0.0..1.0 + 1.0]
+                let max = target.len() as f64 + 1.0;
+                score += count / max;
             }
 
-            // Any missing elements count as maximum error
-            let diff = if TARGET.len() > length { TARGET.len() - length }
-            else { length - TARGET.len() };
-            let mut sum_errors_squared = diff as f64 * 256.0 * 256.0;
-
-            for (a, b) in output.iter().zip(TARGET.as_bytes()) {
-                let diff = if a > b { a - b } else { b - a } as f64;
-                sum_errors_squared += diff * diff;
-            }
-
-            let rms = (sum_errors_squared / TARGET.len() as f64).sqrt();
-            let fitness = 1.0 / (1.0 + rms);
-            OrderedFloat(fitness)
+            OrderedFloat(score / inputs.len() as f64)
         })
         .collect()
     }
@@ -370,7 +350,7 @@ fn main() {
 
     let population_size = 1000;
     let population = (0..population_size).map(|_| Individual::from_rng(&mut rng)).collect();
-    let fitnesses = ReusmannTextSimilarity;
+    let fitnesses = ReusmannTextSimilarity { rng: rng.clone() };
     let reproduce = ReusmannReproduction {
         rng: rng.clone(),
         select_elite: 1,
@@ -390,7 +370,7 @@ fn main() {
             eprintln!("{:.04?}", stats);
             if let Some((i, _h)) = gene.heuristics().iter().enumerate().max_by_key(|(_, h)| *h) {
                 let individual = &gene.population()[i];
-                let output = program_output(&individual.instructions);
+                let output = execute_program(INPUT, &individual.instructions);
                 eprintln!("best output: {:?}", output.as_bstr());
                 eprintln!();
             }
@@ -409,8 +389,11 @@ fn main() {
     let population = gene.population();
     if let Some((i, ind)) = population.iter().enumerate().max_by_key(|(i, _)| heuristics[*i]) {
         eprint!("\x07");
-        println!("best individual: {:?}", ind);
+        let mut output_file = File::create("output.iota").unwrap();
+        output_file.write_all(&ind.instructions).unwrap();
+        println!("Iota program instructions written into 'output.iota'");
+
         println!("best score: {:.04?}", *heuristics[i]);
-        println!("best output: {:?}", program_output(&ind.instructions).as_bstr());
+        println!("best output: {:?}", execute_program(INPUT, &ind.instructions).as_bstr());
     }
 }
