@@ -4,7 +4,6 @@ use std::io::empty;
 
 use bstr::ByteSlice as _;
 use ordered_float::OrderedFloat;
-use rand::distributions::Alphanumeric;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -16,7 +15,7 @@ use reustmann::{Program, Interpreter};
 use genegene::{Genetic, Fitnesses, Reproduce};
 
 const ARCH_LENGTH: usize = 32;
-const HELLO_WORLD: &str = "Hello World!";
+const TARGET: &str = "Hello World!";
 const INSTRUCTIONS: [Instruction; 46] = [
     Instruction::Nop,
     Instruction::Reset,
@@ -70,7 +69,7 @@ fn random_instruction<R: Rng + ?Sized>(rng: &mut R) -> u8 {
     if rng.gen() {
         OpCode::from(*INSTRUCTIONS.choose(rng).unwrap())
     } else {
-        rng.sample(Alphanumeric) as u8
+        rng.gen_range(32..127)
     }
 }
 
@@ -83,7 +82,7 @@ struct Individual {
 
 impl Individual {
     pub fn from_rng<R: Rng + ?Sized>(rng: &mut R) -> Individual {
-        let size = rng.gen_range(10..=50);
+        let size = rng.gen_range(10..=ARCH_LENGTH);
         Individual { instructions: (0..=size).map(|_| random_instruction(rng)).collect() }
     }
 
@@ -98,31 +97,34 @@ impl Individual {
             if p0 > p1 { (p1, p0) } else { (p0, p1) }
         };
 
-        let instructions = match rng.gen_range(0..3) {
+        let mut instructions: Vec<_> = match rng.gen_range(0..4) {
             0 => // AaaaabbbbbaaaaaAaaaa
                 parent0[0..p0].iter()
-                .chain(&parent1[p0..p0 + p1 - p0])
+                .chain(&parent1[p0..p1])
                 .chain(&parent0[p1..])
-                .chain(&parent0[0..p0])
-                .take(ARCH_LENGTH)
+                .chain(&parent0[..p0])
                 .cloned()
                 .collect(),
             1 => // Aaaaabbbbbaaaaa
-                parent0[0..p0].iter()
+                parent0[..p0].iter()
                 .chain(&parent1[p0..])
                 .chain(&parent0[p1..])
-                .take(ARCH_LENGTH)
                 .cloned()
                 .collect(),
-            _ => // aaaaabbbbbAaaaa
-                parent0[p0..p0 + p1 - p0].iter()
+            2 => // aaaaabbbbbAaaaa
+                parent0[p0..p1].iter()
                 .chain(&parent1[p1..])
                 .chain(&parent0[p0..])
-                .take(ARCH_LENGTH)
+                .cloned()
+                .collect(),
+            _ => // aaaaabbbbb
+                parent0[p0..p1].iter()
+                .chain(&parent1[p1..])
                 .cloned()
                 .collect(),
         };
 
+        instructions.truncate(ARCH_LENGTH);
         Individual { instructions }
     }
 
@@ -132,6 +134,7 @@ impl Individual {
             let num_chars_to_mutate = mutation_rate * num_instrs as f64 + 0.5 + rng.gen::<f64>();
             for _ in 0..num_chars_to_mutate as usize {
                 let instr = self.instructions.choose_mut(rng).unwrap();
+                *instr = random_instruction(rng);
 
                 // This replaces a char with a random char from the Iota opcode set:
                 //ind.mGenome[idx] = programCharset[rand() % programCharset.size()];
@@ -142,7 +145,7 @@ impl Individual {
 
                 // or, alternatively, the following line replaces a char with:
                 // any random *printable* char for a prettier display during evolution:
-                *instr = rng.gen_range(32..=126);
+                // *instr = rng.gen_range(32..127);
                 // } else {
                 //     // or incr or decr the instruction by one:
                 //     if rng.gen() { instr.wrapping_add(1) } else { instr.wrapping_sub(1) }
@@ -191,18 +194,22 @@ impl Fitnesses<Individual, Heuristic> for ReusmannTextSimilarity {
             let output = program_output(&individual.instructions);
 
             let mut count = 0.0;
-            for (a, b) in HELLO_WORLD.as_bytes().iter().zip(&output) {
-                let diff = if a > b { a - b } else { b - a };
-                count += if diff == 0 { 1.0 } else if diff <= 50 { 0.3 } else { 0.0 };
+            for (a, b) in TARGET.as_bytes().iter().zip(&output) {
+                count += if a == b { 1.0 } else { 0.0 };
+                // let diff = if a > b { a - b } else { b - a };
+                // count += if diff == 0 { 1.0 } else if diff <= 50 { 0.3 } else { 0.0 };
+                // count += 1.0 - diff as f64 / u8::MAX as f64;
             }
 
             // Optional to evolve an exact-length solution:
             // Give credit for having the correct length;
             // Exact length counts as much as getting one char correct:
-            if HELLO_WORLD.len() == output.len() { count += 1.0 }
+            if TARGET.len() == output.len() {
+                count += 1.0;
+            }
 
             // normalize to [0.0..1.0 + 1]
-            let max = HELLO_WORLD.len() as f64 + 1.0;
+            let max = TARGET.len() as f64 + 1.0;
             OrderedFloat(count / max)
         })
         .collect()
@@ -220,22 +227,22 @@ impl Fitnesses<Individual, Heuristic> for ReusmannSimilarityRMS {
         population.par_iter().map(|individual| {
             let output = program_output(&individual.instructions);
 
-            let length = cmp::min(output.len(), HELLO_WORLD.len());
-            if length == 0 || output.len() == 0 || HELLO_WORLD.len() == 0 {
+            let length = cmp::min(output.len(), TARGET.len());
+            if length == 0 || output.len() == 0 || TARGET.len() == 0 {
                 return OrderedFloat(0.0);
             }
 
             // Any missing elements count as maximum error
-            let diff = if HELLO_WORLD.len() > length { HELLO_WORLD.len() - length }
-            else { length - HELLO_WORLD.len() };
+            let diff = if TARGET.len() > length { TARGET.len() - length }
+            else { length - TARGET.len() };
             let mut sum_errors_squared = diff as f64 * 256.0 * 256.0;
 
-            for (a, b) in output.iter().zip(HELLO_WORLD.as_bytes()) {
+            for (a, b) in output.iter().zip(TARGET.as_bytes()) {
                 let diff = if a > b { a - b } else { b - a } as f64;
                 sum_errors_squared += diff * diff;
             }
 
-            let rms = (sum_errors_squared / HELLO_WORLD.len() as f64).sqrt();
+            let rms = (sum_errors_squared / TARGET.len() as f64).sqrt();
             let fitness = 1.0 / (1.0 + rms);
             OrderedFloat(fitness)
         })
@@ -401,6 +408,7 @@ fn main() {
     let heuristics = gene.heuristics();
     let population = gene.population();
     if let Some((i, ind)) = population.iter().enumerate().max_by_key(|(i, _)| heuristics[*i]) {
+        eprint!("\x07");
         println!("best individual: {:?}", ind);
         println!("best score: {:.04?}", *heuristics[i]);
         println!("best output: {:?}", program_output(&ind.instructions).as_bstr());
